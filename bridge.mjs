@@ -30,6 +30,32 @@ const ALLOW_FILE = path.join(CONFIG_DIR, "allow.json");
 const META_KEY = "x-codex-turn-metadata";
 const EXPOSED_TOOLS = new Set(["js", "js_reset"]);
 const IDLE_TURN_MS = Number(process.env.CODEX_CU_IDLE_TURN_MS) || 3 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = Number(process.env.CODEX_CU_TIMEOUT_MS) || 90_000;
+const WARMUP = process.env.CODEX_CU_WARMUP !== "0";
+
+// Everyday low-risk apps, approved without a prompt.
+const DEFAULT_ALLOW = [
+  "Calculator", "Notes", "Finder", "Preview", "Calendar", "Reminders",
+  "Music", "Pages", "Numbers", "Keynote", "TextEdit", "Photos", "Maps", "Weather", "Clock",
+];
+// Apps where a mistake costs money or embarrassment: always ask, never remembered.
+const ALWAYS_ASK = [
+  "Mail", "Messages", "1Password", "1Password 7", "Keychain Access", "Passwords",
+  "System Settings", "System Preferences", "Terminal", "iTerm2", "Wallet", "Banking",
+];
+const alwaysAsk = (app) =>
+  ALWAYS_ASK.some((a) => a.toLowerCase() === app.toLowerCase()) || /bank|wallet|venmo|paypal|coinbase/i.test(app);
+
+// Prepended to the js tool description so Claude can act on its first call
+// instead of spending a round trip reading the full API docs.
+const CHEAT_SHEET = `Quick start (Mac apps):
+  let app = await cua.getApp("Reminders");   // first call: exactly this, nothing else
+  await app.typeText("text"); await app.pressKey("Return"); // also "cmd+n", "Escape"
+  nodeRepl.write(await app.getAXState());     // read the UI tree (numbered elements)
+  await app.click(12); await app.setValue(12, "text"); // by element number from getAXState
+Work on windows where they are. Pass timeout_ms for slow steps.
+
+`;
 const NATIVE_PROMPTS = process.platform === "darwin" && process.env.CODEX_CU_NATIVE_PROMPTS !== "0";
 const APP_CONSENT = /^Allow Computer Use to use "(.+)"\?$/;
 
@@ -67,7 +93,7 @@ function loadAllowlist() {
   try {
     fromFile = JSON.parse(fs.readFileSync(ALLOW_FILE, "utf8")).apps ?? [];
   } catch {}
-  return new Set([...fromEnv, ...fromFile].map((s) => s.toLowerCase()));
+  return new Set([...DEFAULT_ALLOW, ...fromEnv, ...fromFile].map((s) => s.toLowerCase()));
 }
 
 function persistAllow(app) {
@@ -183,7 +209,8 @@ function main() {
   async function handleElicitation(msg) {
     const prompt = msg.params?.message ?? "";
     const app = prompt.match(APP_CONSENT)?.[1];
-    if (app && (approvedThisSession.has(app) || allowlist.has(app.toLowerCase()))) {
+    const sensitive = app && alwaysAsk(app);
+    if (app && !sensitive && (approvedThisSession.has(app) || allowlist.has(app.toLowerCase()))) {
       approvedThisSession.add(app);
       log(`allowed (allowlist): ${app}`);
       return reply(msg.id, true);
@@ -192,12 +219,53 @@ function main() {
       log(`declined (no prompt available): ${prompt}`);
       return reply(msg.id, false);
     }
-    const choice = await askUser(prompt || "Allow this action?");
+    const note = sensitive ? "\n\nThis is a sensitive app, so it asks every time." : "";
+    const choice = await askUser((prompt || "Allow this action?") + note);
     log(`prompt "${prompt}" -> ${choice}`);
     if (choice === "Deny") return reply(msg.id, false);
-    if (app) approvedThisSession.add(app);
-    if (choice === "Always Allow" && app) persistAllow(app);
-    reply(msg.id, true, choice === "Always Allow");
+    const remember = choice === "Always Allow" && app && !sensitive;
+    if (app && !sensitive) approvedThisSession.add(app);
+    if (remember) persistAllow(app);
+    reply(msg.id, true, remember);
+  }
+
+  // Internal requests (warm-up, turn_ended) use "bridge-" ids and never reach the client.
+  const internal = new Map();
+  const internalCall = (name, args, timeoutMs) =>
+    new Promise((resolve) => {
+      const id = `bridge-${internalId++}`;
+      const timer = setTimeout(() => internal.delete(id) && resolve(null), timeoutMs);
+      internal.set(id, (m) => (clearTimeout(timer), resolve(m)));
+      send(server.stdin, {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args, _meta: { [META_KEY]: { session_id: SESSION_ID, turn_id: turnId } } },
+      });
+    });
+
+  // Warm up the Computer Use service so the first real call doesn't hit a cold start,
+  // then reset the REPL so the client's first call still gets the full API docs.
+  // Client tool calls wait in a queue until this finishes.
+  let warm = !WARMUP;
+  const queued = [];
+  async function warmUp() {
+    const t0 = Date.now();
+    await internalCall("js", { code: "await cua.getState();", timeout_ms: DEFAULT_TIMEOUT_MS }, DEFAULT_TIMEOUT_MS + 5000);
+    await internalCall("js_reset", {}, 15000);
+    log(`warm-up done in ${Date.now() - t0}ms`);
+    warm = true;
+    for (const m of queued.splice(0)) forwardCall(m);
+  }
+
+  function forwardCall(msg) {
+    const params = (msg.params ??= {});
+    if (params.name === "js") params.arguments = { timeout_ms: DEFAULT_TIMEOUT_MS, ...params.arguments };
+    params._meta = { ...params._meta, [META_KEY]: { session_id: SESSION_ID, turn_id: turnId } };
+    turnUsed = true;
+    pendingCalls.add(msg.id);
+    clearTimeout(idleTimer);
+    send(server.stdin, msg);
   }
 
   // client -> server
@@ -208,13 +276,10 @@ function main() {
     } else if (msg.method === "tools/list") {
       toolsListIds.add(msg.id);
     } else if (msg.method === "tools/call") {
-      const params = (msg.params ??= {});
-      params._meta = { ...params._meta, [META_KEY]: { session_id: SESSION_ID, turn_id: turnId } };
-      turnUsed = true;
-      pendingCalls.add(msg.id);
-      clearTimeout(idleTimer);
+      return warm ? forwardCall(msg) : void queued.push(msg);
     }
     send(server.stdin, msg);
+    if (msg.method === "notifications/initialized" && WARMUP) warmUp();
   });
   process.stdin.on("end", () => shutdown());
 
@@ -222,9 +287,14 @@ function main() {
   lineReader(server.stdout, (msg) => {
     if (msg.method === "elicitation/create" && "id" in msg) return void handleElicitation(msg);
     const isResponse = msg.method == null;
-    if (isResponse && typeof msg.id === "string" && msg.id.startsWith("bridge-")) return;
+    if (isResponse && typeof msg.id === "string" && msg.id.startsWith("bridge-")) {
+      internal.get(msg.id)?.(msg);
+      internal.delete(msg.id);
+      return;
+    }
     if (isResponse && toolsListIds.delete(msg.id) && Array.isArray(msg.result?.tools)) {
       msg.result.tools = msg.result.tools.filter((t) => EXPOSED_TOOLS.has(t.name));
+      for (const t of msg.result.tools) if (t.name === "js") t.description = CHEAT_SHEET + (t.description ?? "");
     }
     if (isResponse && pendingCalls.delete(msg.id) && pendingCalls.size === 0) {
       clearTimeout(idleTimer);

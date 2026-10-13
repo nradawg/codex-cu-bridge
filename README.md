@@ -27,17 +27,31 @@ git clone <this repo> && cd codex-cu-bridge && ./install.sh
 
 Then restart Claude Code. Check health anytime with `node bridge.mjs doctor`.
 
-## Allowlist
+## App approvals
 
-- Click **Always Allow** in the dialog - saved to `~/.config/codex-cu-bridge/allow.json`
-- Or set `CODEX_CU_ALLOW="Calculator,Notes"` in the environment
-- `CODEX_CU_NATIVE_PROMPTS=0` turns off dialogs (non-allowlisted apps are then declined)
+- **Pre-approved:** Calculator, Notes, Finder, Preview, Calendar, Reminders, Music, Pages, Numbers, Keynote, TextEdit, Photos, Maps, Weather, Clock
+- **Always asks, never remembered:** Mail, Messages, password apps, Keychain, Terminal, System Settings, Wallet, anything bank/Venmo/PayPal/Coinbase
+- **Everything else:** native Allow / Always Allow / Deny dialog; Always Allow saves to `~/.config/codex-cu-bridge/allow.json`
+- Extra apps via `CODEX_CU_ALLOW="Slack,Figma"`; `CODEX_CU_NATIVE_PROMPTS=0` turns off dialogs (unlisted apps are then declined)
+
+## Speed
+
+- Warms the Computer Use service on startup (~1s) so the first real call doesn't cold-start
+- `js` calls default to a 90s timeout (`CODEX_CU_TIMEOUT_MS`); `CODEX_CU_WARMUP=0` disables warm-up
+- A short API cheat sheet is prepended to the `js` tool description so Claude acts on its first call
+
+## Zero-friction setup in Claude Code
+
+- Add `"mcp__codex-cu__js"` and `"mcp__codex-cu__js_reset"` to `permissions.allow` in `~/.claude/settings.json`
+- Add a line to `~/.claude/CLAUDE.md` telling Claude to use codex-cu for Mac-app tasks (see `docs/CLAUDE-snippet.md`)
 
 ## Verified
 
 On 2026-10-13 with ChatGPT Computer Use `26.1007.41230`, Claude Code 2.1.296:
 - `node test/e2e.mjs` drove Calculator through the bridge: typed `12*34=`, read back `408`
 - A headless `claude -p` session, using only the `codex-cu` tool, computed 37×91 in Calculator and reported `3367`
+- Hands-off: `claude -p "add 'buy milk' to my Reminders"` (no tool named, no permission flags) picked codex-cu itself, added exactly one reminder, 0 permission prompts
+- Harness run after warm-up: 5s end to end (was 30-60s with a cold-start timeout)
 
 ## Caveats
 
