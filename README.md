@@ -22,28 +22,42 @@ Claude does the thinking; Codex's helper does the clicking and typing. No OpenAI
 ## Install
 
 ```bash
-git clone <this repo> && cd codex-cu-bridge && ./install.sh
+git clone https://github.com/nradawg/codex-cu-bridge.git && cd codex-cu-bridge && ./install.sh
 ```
 
-Then restart Claude Code. Check health anytime with `node bridge.mjs doctor`.
+Then restart Claude Code. Check health anytime with `node bridge.mjs doctor --live`.
 
 ## App approvals
 
-- **Pre-approved:** Calculator, Notes, Finder, Preview, Calendar, Reminders, Music, Pages, Numbers, Keynote, TextEdit, Photos, Maps, Weather, Clock
-- **Always asks, never remembered:** Mail, Messages, password apps, Keychain, Terminal, System Settings, Wallet, anything bank/Venmo/PayPal/Coinbase
-- **Everything else:** native Allow / Always Allow / Deny dialog; Always Allow saves to `~/.config/codex-cu-bridge/allow.json`
-- Extra apps via `CODEX_CU_ALLOW="Slack,Figma"`; `CODEX_CU_NATIVE_PROMPTS=0` turns off dialogs (unlisted apps are then declined)
+- **Default:** nothing is pre-approved. The first time Claude touches an app you get a native Allow / Always Allow / Deny dialog. Always Allow saves it to `~/.config/codex-cu-bridge/allow.json`.
+- **Always asks, never remembered:** Mail, Messages, password apps, Keychain, Terminal, System Settings, Wallet, anything bank/Venmo/PayPal/Coinbase. These can't be allowlisted by any setting.
+- **Skip the dialog for apps you trust:** `CODEX_CU_ALLOW="Calculator,Notes,Reminders"` (set it in the `env` of the `codex-cu` entry in your Claude Code MCP config), or click Always Allow once.
+- `CODEX_CU_NATIVE_PROMPTS=0` turns off dialogs; anything not allowlisted is then declined.
 
 ## Speed
 
-- Warms the Computer Use service on startup (~1s) so the first real call doesn't cold-start
-- `js` calls default to a 90s timeout (`CODEX_CU_TIMEOUT_MS`); `CODEX_CU_WARMUP=0` disables warm-up
+- Warms the Computer Use service in the background on startup so the first real call doesn't cold-start. It never blocks your calls; `CODEX_CU_WARMUP=0` turns it off
+- `js` calls default to a 90s timeout (`CODEX_CU_TIMEOUT_MS`, or pass `timeout_ms` per call)
 - A short API cheat sheet is prepended to the `js` tool description so Claude acts on its first call
 
 ## Zero-friction setup in Claude Code
 
 - Add `"mcp__codex-cu__js"` and `"mcp__codex-cu__js_reset"` to `permissions.allow` in `~/.claude/settings.json`
 - Add a line to `~/.claude/CLAUDE.md` telling Claude to use codex-cu for Mac-app tasks (see `docs/CLAUDE-snippet.md`)
+
+## Tests
+
+- `npm test` runs protocol tests against a mock Computer Use server (works on any OS, no ChatGPT needed): tool filtering, hidden-tool rejection, request id isolation, non-blocking warm-up, consent defaults, cancellation and server-request remapping.
+- `node test/e2e.mjs 'let app = await cua.getApp("Calculator");'` runs against the real thing on your Mac and exits 1 on any error or hang.
+
+## Troubleshooting
+
+Start with `node bridge.mjs doctor --live`. It checks the install, whether your Mac is locked, and whether Computer Use actually answers, and tells you what to fix.
+
+- **`doctor` says Computer Use is not installed:** open the ChatGPT app, go to Codex, turn on Computer Use and use it once.
+- **Your Mac is locked:** Computer Use can't see or click anything on a locked screen, and calls just hang ([openai/codex#26415](https://github.com/openai/codex/issues/26415)). Unlock it and retry.
+- **Calls time out / e2e hangs:** quit the ChatGPT app fully, make sure `SkyComputerUseService` is gone (Activity Monitor), reopen ChatGPT, and check that *Codex Computer Use* has Accessibility and Screen & System Audio Recording in System Settings → Privacy & Security. Then rerun the e2e.
+- **After a ChatGPT update:** rerun `./install.sh`; the bridge always picks the newest installed Computer Use version.
 
 ## Verified
 
@@ -55,7 +69,7 @@ On 2026-10-13 with ChatGPT Computer Use `26.1007.41230`, Claude Code 2.1.296:
 
 ## Caveats
 
-Unofficial. Depends on undocumented ChatGPT app internals - an app update can break it. A single `js` call times out at 30s by default (pass `timeout_ms`). Computer Use can read everything visible in an app you allow.
+Unofficial and not affiliated with OpenAI or Anthropic. Depends on undocumented ChatGPT app internals, so an app update can break it. Computer Use can read everything visible in an app you allow.
 
 ## Credit
 

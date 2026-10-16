@@ -1,0 +1,14 @@
+{
+  "name": "codex-cu-bridge",
+  "version": "1.0.0",
+  "description": "Let Claude Code control Mac apps through the Codex Computer Use engine in the ChatGPT desktop app",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node --test test/bridge.test.mjs",
+    "e2e": "node test/e2e.mjs",
+    "doctor": "node bridge.mjs doctor"
+  }
+}

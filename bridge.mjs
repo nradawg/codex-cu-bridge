@@ -17,11 +17,12 @@
 // Approach adapted from shiptomorrow/claude-codex-computer-use and
 // bcharleson/codex-cu-mcp (both MIT). No OpenAI code is included.
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const PLUGIN_ROOT = path.join(CODEX_HOME, "plugins/cache/openai-bundled/unified-computer-use");
@@ -32,12 +33,9 @@ const EXPOSED_TOOLS = new Set(["js", "js_reset"]);
 const IDLE_TURN_MS = Number(process.env.CODEX_CU_IDLE_TURN_MS) || 3 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = Number(process.env.CODEX_CU_TIMEOUT_MS) || 90_000;
 const WARMUP = process.env.CODEX_CU_WARMUP !== "0";
-
-// Everyday low-risk apps, approved without a prompt.
-const DEFAULT_ALLOW = [
-  "Calculator", "Notes", "Finder", "Preview", "Calendar", "Reminders",
-  "Music", "Pages", "Numbers", "Keynote", "TextEdit", "Photos", "Maps", "Weather", "Clock",
-];
+const WARMUP_TIMEOUT_MS = 30_000;
+// How long a cancelled or timed-out request is remembered so its late response is dropped.
+const GRACE_MS = 60_000;
 // Apps where a mistake costs money or embarrassment: always ask, never remembered.
 const ALWAYS_ASK = [
   "Mail", "Messages", "1Password", "1Password 7", "Keychain Access", "Passwords",
@@ -93,7 +91,8 @@ function loadAllowlist() {
   try {
     fromFile = JSON.parse(fs.readFileSync(ALLOW_FILE, "utf8")).apps ?? [];
   } catch {}
-  return new Set([...DEFAULT_ALLOW, ...fromEnv, ...fromFile].map((s) => s.toLowerCase()));
+  // Nothing is approved by default, and sensitive apps can never be allowlisted.
+  return new Set([...fromEnv, ...fromFile].filter((a) => !alwaysAsk(a)).map((s) => s.toLowerCase()));
 }
 
 function persistAllow(app) {
@@ -173,26 +172,64 @@ function main() {
     log(`failed to start cua_repl: ${e.message}`);
     process.exit(1);
   });
+  server.stdin.on("error", (e) => log(`cua_repl stdin: ${e.message}`));
 
   const SESSION_ID = randomUUID();
   let turnId = randomUUID();
   let turnUsed = false;
+  let clientCalled = false;
   let idleTimer = null;
   let shuttingDown = false;
-  let internalId = 0;
   const pendingCalls = new Set();
-  const toolsListIds = new Set();
   const approvedThisSession = new Set();
   const allowlist = loadAllowlist();
+  const key = (id) => JSON.stringify(id);
+  const later = (fn) => setTimeout(fn, GRACE_MS).unref();
+
+  // Every request the bridge sends to cua_repl gets a fresh id from its own counter,
+  // whether it came from the client or from the bridge, so ids can never collide.
+  // toServer: our id -> { clientId, method, cancelled } or { internal }
+  let nextServerId = 1;
+  const toServer = new Map();
+  const clientToServer = new Map();
+  // Requests cua_repl sends to the client are remapped the same way in the other direction.
+  let nextClientId = 1;
+  const toClient = new Map();
+  const serverToClient = new Map();
+
+  const forget = (sid) => {
+    const entry = toServer.get(sid);
+    toServer.delete(sid);
+    if (entry && "clientId" in entry && clientToServer.get(key(entry.clientId)) === sid) {
+      clientToServer.delete(key(entry.clientId));
+    }
+  };
+
+  const callMeta = (params) => ({ ...params?._meta, [META_KEY]: { session_id: SESSION_ID, turn_id: turnId } });
+
+  // Bridge-originated calls (warm-up, turn_ended). Resolves with the response, or null on timeout.
+  const internalCall = (name, args, timeoutMs) =>
+    new Promise((resolve) => {
+      const id = nextServerId++;
+      const timer = setTimeout(() => {
+        toServer.set(id, { cancelled: true });
+        later(() => toServer.delete(id));
+        send(server.stdin, { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id, reason: "timeout" } });
+        resolve(null);
+      }, timeoutMs);
+      timer.unref();
+      toServer.set(id, { internal: (m) => (clearTimeout(timer), resolve(m)) });
+      send(server.stdin, {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args, _meta: callMeta() },
+      });
+    });
 
   const endTurn = () => {
     if (!turnUsed) return;
-    send(server.stdin, {
-      jsonrpc: "2.0",
-      id: `bridge-${internalId++}`,
-      method: "tools/call",
-      params: { name: "turn_ended", arguments: { hook_event_name: "Stop", session_id: SESSION_ID, turn_id: turnId } },
-    });
+    internalCall("turn_ended", { hook_event_name: "Stop", session_id: SESSION_ID, turn_id: turnId }, 5000);
     turnId = randomUUID();
     turnUsed = false;
   };
@@ -229,79 +266,112 @@ function main() {
     reply(msg.id, true, remember);
   }
 
-  // Internal requests (warm-up, turn_ended) use "bridge-" ids and never reach the client.
-  const internal = new Map();
-  const internalCall = (name, args, timeoutMs) =>
-    new Promise((resolve) => {
-      const id = `bridge-${internalId++}`;
-      const timer = setTimeout(() => internal.delete(id) && resolve(null), timeoutMs);
-      internal.set(id, (m) => (clearTimeout(timer), resolve(m)));
-      send(server.stdin, {
-        jsonrpc: "2.0",
-        id,
-        method: "tools/call",
-        params: { name, arguments: args, _meta: { [META_KEY]: { session_id: SESSION_ID, turn_id: turnId } } },
-      });
-    });
-
-  // Warm up the Computer Use service so the first real call doesn't hit a cold start,
-  // then reset the REPL so the client's first call still gets the full API docs.
-  // Client tool calls wait in a queue until this finishes.
-  let warm = !WARMUP;
-  const queued = [];
+  // Best-effort warm-up so the first real call doesn't cold-start. It runs in the
+  // background and never holds up client traffic. The REPL is reset afterwards only
+  // if the client hasn't started using it, so the client's first call still gets the docs.
   async function warmUp() {
     const t0 = Date.now();
-    await internalCall("js", { code: "await cua.getState();", timeout_ms: DEFAULT_TIMEOUT_MS }, DEFAULT_TIMEOUT_MS + 5000);
-    await internalCall("js_reset", {}, 15000);
+    const r = await internalCall("js", { code: "await cua.getState();", timeout_ms: WARMUP_TIMEOUT_MS }, WARMUP_TIMEOUT_MS + 5000);
+    if (!r || r.error || r.result?.isError) {
+      const hint = screenLocked() ? " - your Mac is locked; Computer Use can't work until it's unlocked" : "; run `node bridge.mjs doctor --live` to check";
+      return log(`warm-up did not finish (${r ? "error" : "timeout"})${hint}`);
+    }
+    if (!clientCalled) await internalCall("js_reset", {}, 15000);
     log(`warm-up done in ${Date.now() - t0}ms`);
-    warm = true;
-    for (const m of queued.splice(0)) forwardCall(m);
   }
 
-  function forwardCall(msg) {
-    const params = (msg.params ??= {});
-    if (params.name === "js") params.arguments = { timeout_ms: DEFAULT_TIMEOUT_MS, ...params.arguments };
-    params._meta = { ...params._meta, [META_KEY]: { session_id: SESSION_ID, turn_id: turnId } };
-    turnUsed = true;
-    pendingCalls.add(msg.id);
-    clearTimeout(idleTimer);
-    send(server.stdin, msg);
+  const errorToClient = (id, message) =>
+    send(process.stdout, { jsonrpc: "2.0", id, error: { code: -32602, message } });
+
+  function forwardRequest(msg) {
+    if (msg.method === "tools/call") {
+      const params = (msg.params ??= {});
+      if (!EXPOSED_TOOLS.has(params.name)) return errorToClient(msg.id, `Unknown tool: ${params.name}`);
+      if (params.name === "js") params.arguments = { timeout_ms: DEFAULT_TIMEOUT_MS, ...params.arguments };
+      params._meta = callMeta(params);
+      turnUsed = clientCalled = true;
+      clearTimeout(idleTimer);
+    }
+    const sid = nextServerId++;
+    toServer.set(sid, { clientId: msg.id, method: msg.method });
+    clientToServer.set(key(msg.id), sid);
+    if (msg.method === "tools/call") pendingCalls.add(sid);
+    send(server.stdin, { ...msg, id: sid });
+  }
+
+  function callSettled(sid) {
+    if (pendingCalls.delete(sid) && pendingCalls.size === 0) {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(endTurn, IDLE_TURN_MS);
+      idleTimer.unref();
+    }
   }
 
   // client -> server
   lineReader(process.stdin, (msg) => {
-    if (msg.method === "initialize") {
-      const caps = (msg.params ??= {}).capabilities ?? {};
-      msg.params.capabilities = { ...caps, elicitation: { ...(caps.elicitation ?? {}), form: {} } };
-    } else if (msg.method === "tools/list") {
-      toolsListIds.add(msg.id);
-    } else if (msg.method === "tools/call") {
-      return warm ? forwardCall(msg) : void queued.push(msg);
+    const hasId = msg.id !== undefined && msg.id !== null;
+    if (msg.method && hasId) {
+      if (msg.method === "initialize") {
+        const caps = (msg.params ??= {}).capabilities ?? {};
+        msg.params.capabilities = { ...caps, elicitation: { ...(caps.elicitation ?? {}), form: {} } };
+      }
+      return forwardRequest(msg);
     }
-    send(server.stdin, msg);
-    if (msg.method === "notifications/initialized" && WARMUP) warmUp();
+    if (msg.method) {
+      if (msg.method === "notifications/cancelled") {
+        const sid = clientToServer.get(key(msg.params?.requestId));
+        const entry = sid && toServer.get(sid);
+        if (!entry || entry.cancelled) return;
+        entry.cancelled = true;
+        callSettled(sid);
+        later(() => forget(sid));
+        return send(server.stdin, { ...msg, params: { ...msg.params, requestId: sid } });
+      }
+      send(server.stdin, msg);
+      if (msg.method === "notifications/initialized" && WARMUP) warmUp();
+      return;
+    }
+    // A response to a request cua_repl sent the client.
+    const original = toClient.get(key(msg.id));
+    if (!original) return;
+    toClient.delete(key(msg.id));
+    serverToClient.delete(key(original.id));
+    send(server.stdin, { ...msg, id: original.id });
   });
   process.stdin.on("end", () => shutdown());
 
   // server -> client
   lineReader(server.stdout, (msg) => {
-    if (msg.method === "elicitation/create" && "id" in msg) return void handleElicitation(msg);
-    const isResponse = msg.method == null;
-    if (isResponse && typeof msg.id === "string" && msg.id.startsWith("bridge-")) {
-      internal.get(msg.id)?.(msg);
-      internal.delete(msg.id);
-      return;
+    const hasId = msg.id !== undefined && msg.id !== null;
+    if (msg.method === "elicitation/create" && hasId) return void handleElicitation(msg);
+    if (msg.method && hasId) {
+      const cid = `cua-${nextClientId++}`;
+      toClient.set(key(cid), { id: msg.id });
+      serverToClient.set(key(msg.id), cid);
+      return send(process.stdout, { ...msg, id: cid });
     }
-    if (isResponse && toolsListIds.delete(msg.id) && Array.isArray(msg.result?.tools)) {
+    if (msg.method) {
+      if (msg.method === "notifications/cancelled") {
+        const cid = serverToClient.get(key(msg.params?.requestId));
+        if (!cid) return;
+        serverToClient.delete(key(msg.params.requestId));
+        later(() => toClient.delete(key(cid)));
+        return send(process.stdout, { ...msg, params: { ...msg.params, requestId: cid } });
+      }
+      return send(process.stdout, msg);
+    }
+    // A response to something we sent.
+    const entry = toServer.get(msg.id);
+    if (!entry) return log(`dropping response to unknown id ${key(msg.id)}`);
+    if (entry.internal) return void (forget(msg.id), entry.internal(msg));
+    if (entry.cancelled) return; // kept until the grace timer clears it
+    forget(msg.id);
+    callSettled(msg.id);
+    if (entry.method === "tools/list" && Array.isArray(msg.result?.tools)) {
       msg.result.tools = msg.result.tools.filter((t) => EXPOSED_TOOLS.has(t.name));
       for (const t of msg.result.tools) if (t.name === "js") t.description = CHEAT_SHEET + (t.description ?? "");
     }
-    if (isResponse && pendingCalls.delete(msg.id) && pendingCalls.size === 0) {
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(endTurn, IDLE_TURN_MS);
-      idleTimer.unref();
-    }
-    send(process.stdout, msg);
+    send(process.stdout, { ...msg, id: entry.clientId });
   });
 
   server.on("exit", (code) => {
@@ -322,7 +392,49 @@ function main() {
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, shutdown);
 }
 
-if (process.argv[2] === "doctor") {
+// ---------- doctor ----------
+
+// Computer Use can't see or drive apps while the Mac is locked; requests hang or fail.
+function screenLocked() {
+  if (process.platform !== "darwin") return false;
+  try {
+    const out = execFileSync("ioreg", ["-n", "Root", "-d1"], { encoding: "utf8", timeout: 3000 });
+    return /"(IOConsoleLocked|CGSSessionScreenIsLocked)"\s*=\s*Yes/.test(out);
+  } catch {
+    return false;
+  }
+}
+
+// Starts this bridge like an MCP client would and asks Computer Use to list apps.
+function liveCheck(timeoutMs) {
+  return new Promise((resolve) => {
+    const p = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+      env: { ...process.env, CODEX_CU_WARMUP: "0" },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    const finish = (ok, detail) => {
+      clearTimeout(timer);
+      p.kill();
+      resolve({ ok, detail });
+    };
+    const timer = setTimeout(() => finish(false, `no answer from Computer Use within ${timeoutMs / 1000}s`), timeoutMs);
+    p.on("exit", (code) => finish(false, `bridge exited early (code ${code})`));
+    lineReader(p.stdout, (m) => {
+      if (m.id === 1) {
+        send(p.stdin, { jsonrpc: "2.0", method: "notifications/initialized" });
+        send(p.stdin, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "js", arguments: { code: "await cua.listApps();", timeout_ms: timeoutMs } } });
+      } else if (m.id === 2) {
+        const text = (m.result?.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join(" ");
+        if (m.error || m.result?.isError) finish(false, (m.error?.message ?? text).slice(0, 300));
+        else finish(true, "Computer Use answered");
+      }
+    });
+    send(p.stdin, { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "codex-cu-bridge-doctor", version: "1" } } });
+  });
+}
+
+async function doctor(live) {
+  let bad = false;
   try {
     const { version, file, cfg } = findServerConfig();
     console.log(`ok  Codex Computer Use ${version}`);
@@ -334,6 +446,26 @@ if (process.argv[2] === "doctor") {
     console.log(`BAD ${e.message}`);
     process.exit(1);
   }
+  if (screenLocked()) {
+    console.log("BAD your Mac is locked. Unlock it; Computer Use can't work on a locked screen");
+    bad = true;
+  }
+  if (live && !bad) {
+    const r = await liveCheck(Number(process.env.CODEX_CU_DOCTOR_TIMEOUT_MS) || 45_000);
+    console.log(`${r.ok ? "ok " : "BAD"} live check: ${r.detail}`);
+    if (!r.ok) {
+      console.log("    Fix: quit ChatGPT fully, make sure SkyComputerUseService is gone in Activity Monitor, reopen ChatGPT,");
+      console.log("    and check Codex Computer Use has Accessibility + Screen & System Audio Recording in System Settings.");
+      bad = true;
+    }
+  } else if (!live) {
+    console.log("    (run `node bridge.mjs doctor --live` to also test that Computer Use answers)");
+  }
+  process.exit(bad ? 1 : 0);
+}
+
+if (process.argv[2] === "doctor") {
+  doctor(process.argv.includes("--live"));
 } else {
   main();
 }
