@@ -232,19 +232,39 @@ test("turn_ended is sent on exit after the client used a tool", async () => {
   assert.equal(ended.params.arguments.hook_event_name, "Stop");
 });
 
-test("doctor reports an empty allowlist by default", async () => {
+function runDoctor(args, env = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cu-doc-"));
   const pluginDir = path.join(root, "codex/plugins/cache/openai-bundled/unified-computer-use/1.0.0");
   fs.mkdirSync(pluginDir, { recursive: true });
-  fs.writeFileSync(path.join(pluginDir, ".mcp.json"), JSON.stringify({ mcpServers: { cua_repl: { command: process.execPath } } }));
-  const out = await new Promise((resolve) => {
-    const d = spawn(process.execPath, [path.join(here, "../bridge.mjs"), "doctor"], {
-      env: { PATH: process.env.PATH, HOME: root, CODEX_HOME: path.join(root, "codex") },
+  fs.writeFileSync(
+    path.join(pluginDir, ".mcp.json"),
+    JSON.stringify({ mcpServers: { cua_repl: { command: process.execPath, args: [path.join(here, "mock-cua.mjs")] } } }),
+  );
+  return new Promise((resolve) => {
+    const d = spawn(process.execPath, [path.join(here, "../bridge.mjs"), "doctor", ...args], {
+      env: { PATH: process.env.PATH, HOME: root, CODEX_HOME: path.join(root, "codex"), CODEX_CU_NATIVE_PROMPTS: "0", ...env },
     });
     let s = "";
     d.stdout.on("data", (x) => (s += x));
     d.on("exit", (code) => resolve({ s, code }));
   });
+}
+
+test("doctor reports an empty allowlist by default", async () => {
+  const out = await runDoctor([]);
   assert.equal(out.code, 0);
   assert.match(out.s, /every app asks first/);
+});
+
+test("doctor --live passes when Computer Use answers", async () => {
+  const out = await runDoctor(["--live"]);
+  assert.equal(out.code, 0, out.s);
+  assert.match(out.s, /ok  live check/);
+});
+
+test("doctor --live fails with a fix when Computer Use hangs", async () => {
+  const out = await runDoctor(["--live"], { MOCK_HANG: "1", CODEX_CU_DOCTOR_TIMEOUT_MS: "1500" });
+  assert.equal(out.code, 1);
+  assert.match(out.s, /BAD live check: no answer/);
+  assert.match(out.s, /quit ChatGPT fully/);
 });

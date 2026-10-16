@@ -31,6 +31,7 @@ async function onMessage(m) {
   if (name !== "js") return text(m.id, `${name} ok`);
   const code = args.code ?? "";
   if (code === "await cua.getState();") return setTimeout(() => text(m.id, "warm"), WARMUP_DELAY);
+  if (code === "await cua.listApps();") return process.env.MOCK_HANG ? undefined : text(m.id, "[]");
   if (code === "echo") return text(m.id, JSON.stringify({ id: m.id, params: m.params }));
   if (code === "slow") return setTimeout(() => text(m.id, "late"), 300);
   if (code.startsWith("app:")) {

@@ -17,11 +17,12 @@
 // Approach adapted from shiptomorrow/claude-codex-computer-use and
 // bcharleson/codex-cu-mcp (both MIT). No OpenAI code is included.
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const PLUGIN_ROOT = path.join(CODEX_HOME, "plugins/cache/openai-bundled/unified-computer-use");
@@ -271,7 +272,10 @@ function main() {
   async function warmUp() {
     const t0 = Date.now();
     const r = await internalCall("js", { code: "await cua.getState();", timeout_ms: WARMUP_TIMEOUT_MS }, WARMUP_TIMEOUT_MS + 5000);
-    if (!r || r.error || r.result?.isError) return log(`warm-up did not finish (${r ? "error" : "timeout"}); continuing`);
+    if (!r || r.error || r.result?.isError) {
+      const hint = screenLocked() ? " - your Mac is locked; Computer Use can't work until it's unlocked" : "; run `node bridge.mjs doctor --live` to check";
+      return log(`warm-up did not finish (${r ? "error" : "timeout"})${hint}`);
+    }
     if (!clientCalled) await internalCall("js_reset", {}, 15000);
     log(`warm-up done in ${Date.now() - t0}ms`);
   }
@@ -388,7 +392,49 @@ function main() {
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, shutdown);
 }
 
-if (process.argv[2] === "doctor") {
+// ---------- doctor ----------
+
+// Computer Use can't see or drive apps while the Mac is locked; requests hang or fail.
+function screenLocked() {
+  if (process.platform !== "darwin") return false;
+  try {
+    const out = execFileSync("ioreg", ["-n", "Root", "-d1"], { encoding: "utf8", timeout: 3000 });
+    return /"(IOConsoleLocked|CGSSessionScreenIsLocked)"\s*=\s*Yes/.test(out);
+  } catch {
+    return false;
+  }
+}
+
+// Starts this bridge like an MCP client would and asks Computer Use to list apps.
+function liveCheck(timeoutMs) {
+  return new Promise((resolve) => {
+    const p = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+      env: { ...process.env, CODEX_CU_WARMUP: "0" },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    const finish = (ok, detail) => {
+      clearTimeout(timer);
+      p.kill();
+      resolve({ ok, detail });
+    };
+    const timer = setTimeout(() => finish(false, `no answer from Computer Use within ${timeoutMs / 1000}s`), timeoutMs);
+    p.on("exit", (code) => finish(false, `bridge exited early (code ${code})`));
+    lineReader(p.stdout, (m) => {
+      if (m.id === 1) {
+        send(p.stdin, { jsonrpc: "2.0", method: "notifications/initialized" });
+        send(p.stdin, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "js", arguments: { code: "await cua.listApps();", timeout_ms: timeoutMs } } });
+      } else if (m.id === 2) {
+        const text = (m.result?.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join(" ");
+        if (m.error || m.result?.isError) finish(false, (m.error?.message ?? text).slice(0, 300));
+        else finish(true, "Computer Use answered");
+      }
+    });
+    send(p.stdin, { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "codex-cu-bridge-doctor", version: "1" } } });
+  });
+}
+
+async function doctor(live) {
+  let bad = false;
   try {
     const { version, file, cfg } = findServerConfig();
     console.log(`ok  Codex Computer Use ${version}`);
@@ -400,6 +446,26 @@ if (process.argv[2] === "doctor") {
     console.log(`BAD ${e.message}`);
     process.exit(1);
   }
+  if (screenLocked()) {
+    console.log("BAD your Mac is locked. Unlock it; Computer Use can't work on a locked screen");
+    bad = true;
+  }
+  if (live && !bad) {
+    const r = await liveCheck(Number(process.env.CODEX_CU_DOCTOR_TIMEOUT_MS) || 45_000);
+    console.log(`${r.ok ? "ok " : "BAD"} live check: ${r.detail}`);
+    if (!r.ok) {
+      console.log("    Fix: quit ChatGPT fully, make sure SkyComputerUseService is gone in Activity Monitor, reopen ChatGPT,");
+      console.log("    and check Codex Computer Use has Accessibility + Screen & System Audio Recording in System Settings.");
+      bad = true;
+    }
+  } else if (!live) {
+    console.log("    (run `node bridge.mjs doctor --live` to also test that Computer Use answers)");
+  }
+  process.exit(bad ? 1 : 0);
+}
+
+if (process.argv[2] === "doctor") {
+  doctor(process.argv.includes("--live"));
 } else {
   main();
 }

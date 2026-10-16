@@ -25,7 +25,7 @@ Claude does the thinking; Codex's helper does the clicking and typing. No OpenAI
 git clone https://github.com/nradawg/codex-cu-bridge.git && cd codex-cu-bridge && ./install.sh
 ```
 
-Then restart Claude Code. Check health anytime with `node bridge.mjs doctor`.
+Then restart Claude Code. Check health anytime with `node bridge.mjs doctor --live`.
 
 ## App approvals
 
@@ -52,7 +52,10 @@ Then restart Claude Code. Check health anytime with `node bridge.mjs doctor`.
 
 ## Troubleshooting
 
+Start with `node bridge.mjs doctor --live`. It checks the install, whether your Mac is locked, and whether Computer Use actually answers, and tells you what to fix.
+
 - **`doctor` says Computer Use is not installed:** open the ChatGPT app, go to Codex, turn on Computer Use and use it once.
+- **Your Mac is locked:** Computer Use can't see or click anything on a locked screen, and calls just hang ([openai/codex#26415](https://github.com/openai/codex/issues/26415)). Unlock it and retry.
 - **Calls time out / e2e hangs:** quit the ChatGPT app fully, make sure `SkyComputerUseService` is gone (Activity Monitor), reopen ChatGPT, and check that *Codex Computer Use* has Accessibility and Screen & System Audio Recording in System Settings → Privacy & Security. Then rerun the e2e.
 - **After a ChatGPT update:** rerun `./install.sh`; the bridge always picks the newest installed Computer Use version.
 
