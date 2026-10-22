@@ -1,0 +1,11 @@
+{
+  "name": "codex-cu-bridge",
+  "owner": { "name": "nradawg" },
+  "plugins": [
+    {
+      "name": "codex-cu",
+      "source": "./",
+      "description": "Drive Mac apps through the ChatGPT app's Codex Computer Use engine: the codex-cu MCP server plus the /mac skill"
+    }
+  ]
+}

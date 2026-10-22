@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// codex-cu-bridge: lets Claude Code (or any stdio MCP client) use the Codex
-// Computer Use server that ships inside the ChatGPT macOS app.
+// codex-cu-bridge: lets any stdio MCP client (Claude Code, Hermes, OpenClaw,
+// Claude Desktop, Cursor, Goose, ...) use the Codex Computer Use server that
+// ships inside the ChatGPT macOS app.
 //
 // The ChatGPT app installs a computer-use MCP server (`cua_repl`) under
 // ~/.codex/plugins/cache/openai-bundled/unified-computer-use/<version>/.mcp.json.
@@ -119,9 +120,9 @@ function run([text, title]) {
   return ["Allow", "Always Allow", "Deny"][Number(alert.runModal) - 1000] ?? "Deny";
 }`;
 
-function askUser(text) {
+function askUser(text, title) {
   return new Promise((resolve) => {
-    const p = spawn("osascript", ["-l", "JavaScript", "-e", DIALOG_SCRIPT, text, "Claude wants to use Computer Use"], {
+    const p = spawn("osascript", ["-l", "JavaScript", "-e", DIALOG_SCRIPT, text, title], {
       stdio: ["ignore", "pipe", "ignore"],
     });
     let out = "";
@@ -180,6 +181,8 @@ function main() {
   let clientCalled = false;
   let idleTimer = null;
   let shuttingDown = false;
+  // Shown in the approval dialog title; taken from the client's MCP handshake.
+  let clientName = "An agent";
   const pendingCalls = new Set();
   const approvedThisSession = new Set();
   const allowlist = loadAllowlist();
@@ -257,7 +260,7 @@ function main() {
       return reply(msg.id, false);
     }
     const note = sensitive ? "\n\nThis is a sensitive app, so it asks every time." : "";
-    const choice = await askUser((prompt || "Allow this action?") + note);
+    const choice = await askUser((prompt || "Allow this action?") + note, `${clientName} wants to use Computer Use`);
     log(`prompt "${prompt}" -> ${choice}`);
     if (choice === "Deny") return reply(msg.id, false);
     const remember = choice === "Always Allow" && app && !sensitive;
@@ -312,6 +315,7 @@ function main() {
     const hasId = msg.id !== undefined && msg.id !== null;
     if (msg.method && hasId) {
       if (msg.method === "initialize") {
+        clientName = msg.params?.clientInfo?.name || clientName;
         const caps = (msg.params ??= {}).capabilities ?? {};
         msg.params.capabilities = { ...caps, elicitation: { ...(caps.elicitation ?? {}), form: {} } };
       }

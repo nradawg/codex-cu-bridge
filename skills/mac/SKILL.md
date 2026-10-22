@@ -5,7 +5,7 @@ description: Do a task inside a Mac desktop app (Notes, Reminders, Calendar, Fin
 
 # /mac - drive Mac apps via codex-cu
 
-Use the `codex-cu` MCP `js` tool (registered by codex-cu-bridge's install.sh). Not osascript, not screenshot computer-use.
+Use the `codex-cu` MCP `js` tool (registered from codex-cu-bridge; see its README for your client). Not osascript, not screenshot computer-use.
 
 1. First call, exactly one statement: `let app = await cua.getApp("<App Name>");` - read the returned UI state and docs.
 2. Act: `app.typeText()`, `app.pressKey("cmd+n" | "Return" | "Escape")`, `app.click(<element #>)`, `app.setValue(<#>, "text")`.
