@@ -1,7 +1,7 @@
 {
   "name": "codex-cu-bridge",
   "version": "1.0.0",
-  "description": "Let Claude Code control Mac apps through the Codex Computer Use engine in the ChatGPT desktop app",
+  "description": "Expose the ChatGPT app's Codex Computer Use engine as a stdio MCP server any agent can use",
   "type": "module",
   "private": true,
   "license": "MIT",
