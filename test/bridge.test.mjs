@@ -1,7 +1,7 @@
 // Protocol tests for bridge.mjs against a mock cua_repl. Runs anywhere (no Mac needed).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +9,18 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// doctor reports a locked Mac as BAD on purpose, so its tests only mean something on an unlocked host.
+function hostLocked() {
+  if (process.platform !== "darwin") return false;
+  try {
+    const out = execFileSync("ioreg", ["-n", "Root", "-d1"], { encoding: "utf8", timeout: 3000 });
+    return /"(IOConsoleLocked|CGSSessionScreenIsLocked)"\s*=\s*Yes/.test(out);
+  } catch {
+    return false;
+  }
+}
+const LOCKED = hostLocked() && "the Mac screen is locked, so doctor reports BAD by design";
 
 function startBridge({ env = {}, allowFile } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cu-bridge-"));
@@ -250,19 +262,19 @@ function runDoctor(args, env = {}) {
   });
 }
 
-test("doctor reports an empty allowlist by default", async () => {
+test("doctor reports an empty allowlist by default", { skip: LOCKED }, async () => {
   const out = await runDoctor([]);
   assert.equal(out.code, 0);
   assert.match(out.s, /every app asks first/);
 });
 
-test("doctor --live passes when Computer Use answers", async () => {
+test("doctor --live passes when Computer Use answers", { skip: LOCKED }, async () => {
   const out = await runDoctor(["--live"]);
   assert.equal(out.code, 0, out.s);
   assert.match(out.s, /ok  live check/);
 });
 
-test("doctor --live fails with a fix when Computer Use hangs", async () => {
+test("doctor --live fails with a fix when Computer Use hangs", { skip: LOCKED }, async () => {
   const out = await runDoctor(["--live"], { MOCK_HANG: "1", CODEX_CU_DOCTOR_TIMEOUT_MS: "1500" });
   assert.equal(out.code, 1);
   assert.match(out.s, /BAD live check: no answer/);
